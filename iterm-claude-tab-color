@@ -1,0 +1,374 @@
+#!/usr/bin/env python3
+"""Mirror Claude Code's /color session color onto the iTerm2 tab.
+
+Claude Code's /color command is session-local UI state: it is not exposed via
+statusline JSON, hook input, env vars, or settings files. But every
+`/color <name>` invocation IS recorded in the session transcript
+(~/.claude/projects/<project>/<session>.jsonl) as a user entry whose content
+starts with `<command-name>/color</command-name>` and carries
+`<command-args><name></command-args>`.
+
+So: a SessionStart hook spawns one detached watcher per terminal tab (keyed by
+pty). The watcher polls the transcript, and when a /color entry appears it
+writes iTerm2's proprietary tab-color escape sequence (OSC 6) straight to the
+Claude process's pty. It resets the tab and exits when the Claude process dies.
+
+Subcommands:
+  hook          SessionStart hook entry point (reads hook JSON on stdin,
+                spawns/replaces the watcher for this tty, exits immediately)
+  session-end   SessionEnd hook entry point (kills watcher, resets tab)
+  watch         the watcher loop (internal; spawned by `hook`)
+  set <color>   manually set the tab color (name from the palette or #RRGGBB)
+  reset         manually reset the tab color
+"""
+
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+
+# Claude Code's session color palette (dark/light default themes), extracted
+# from the v2.1.251 binary (`<name>_FOR_SUBAGENTS_ONLY` theme keys). /color and
+# subagent colors share this palette.
+PALETTE = {
+    "red": (220, 38, 38),
+    "blue": (106, 155, 204),
+    "green": (22, 163, 74),
+    "yellow": (202, 138, 4),
+    "purple": (130, 125, 189),
+    "orange": (217, 119, 87),
+    "pink": (196, 102, 134),
+    "cyan": (8, 145, 178),
+}
+
+CACHE_DIR = os.path.expanduser("~/.cache/iterm-claude-colored-tabs")
+POLL_INTERVAL = 0.5
+
+_CMD_RE = re.compile(
+    r"^\s*<command-name>/color</command-name>.*?<command-args>([^<]*)</command-args>",
+    re.DOTALL,
+)
+
+
+# --- parsing -----------------------------------------------------------------
+
+def parse_line(line):
+    """Return 'default', a palette color name, or None for a transcript line.
+
+    Only genuine user command entries match: type == "user" and the message
+    content itself (string, or a single text block) starts with the /color
+    command marker. Tool results that merely contain the marker text don't.
+    """
+    try:
+        d = json.loads(line)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if d.get("type") != "user":
+        return None
+    content = d.get("message", {}).get("content")
+    if isinstance(content, list):
+        if len(content) != 1 or not isinstance(content[0], dict):
+            return None
+        if content[0].get("type") != "text":
+            return None
+        content = content[0].get("text")
+    if not isinstance(content, str):
+        return None
+    m = _CMD_RE.match(content)
+    if not m:
+        return None
+    arg = m.group(1).strip()
+    if arg == "default" or arg in PALETTE:
+        return arg
+    return None  # empty (= random, unknowable) or unrecognized
+
+
+def last_color_in_file(path, offset=0):
+    """Scan transcript from offset; return (last color or None, new offset)."""
+    color = None
+    try:
+        with open(path, "rb") as f:
+            f.seek(offset)
+            for raw in f:
+                c = parse_line(raw.decode("utf-8", "replace"))
+                if c:
+                    color = c
+            offset = f.tell()
+    except OSError:
+        pass
+    return color, offset
+
+
+# --- escape sequences ----------------------------------------------------------
+
+def tab_color_sequence(rgb):
+    r, g, b = rgb
+    return (
+        b"\033]6;1;bg;red;brightness;%d\a" % r
+        + b"\033]6;1;bg;green;brightness;%d\a" % g
+        + b"\033]6;1;bg;blue;brightness;%d\a" % b
+    )
+
+
+def tab_reset_sequence():
+    return b"\033]6;1;bg;*;default\a"
+
+
+def wrap_tmux(seq):
+    """Wrap in tmux passthrough (needs `set -g allow-passthrough on`)."""
+    return b"\033Ptmux;" + seq.replace(b"\033", b"\033\033") + b"\033\\"
+
+
+def write_to_tty(tty, seq):
+    if os.environ.get("TMUX"):
+        seq = wrap_tmux(seq)
+    try:
+        with open(tty, "wb", buffering=0) as f:
+            f.write(seq)
+        return True
+    except OSError:
+        return False
+
+
+def apply_color(tty, color):
+    if color == "default":
+        return write_to_tty(tty, tab_reset_sequence())
+    return write_to_tty(tty, tab_color_sequence(PALETTE[color]))
+
+
+# --- process plumbing ---------------------------------------------------------
+
+def is_iterm():
+    return (
+        os.environ.get("TERM_PROGRAM") == "iTerm.app"
+        or os.environ.get("LC_TERMINAL") == "iTerm2"
+    )
+
+
+def tty_of_pid(pid):
+    """Controlling tty of a process, e.g. /dev/ttys004, or None."""
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "tty=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if not out or out.startswith("?"):
+        return None
+    return "/dev/" + out
+
+
+def find_tty():
+    """Nearest controlling tty: stdin if it is one, else walk up the tree."""
+    if os.isatty(0):
+        return os.ttyname(0)
+    pid = os.getpid()
+    for _ in range(10):
+        tty = tty_of_pid(pid)
+        if tty:
+            return tty
+        try:
+            out = subprocess.run(
+                ["ps", "-o", "ppid=", "-p", str(pid)],
+                capture_output=True, text=True, timeout=5,
+            ).stdout.strip()
+            pid = int(out)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return None
+        if pid <= 1:
+            return None
+    return None
+
+
+def claude_ancestor():
+    """Nearest ancestor that is the claude CLI process (hooks may run under
+    an intermediate `sh -c`, so plain PPID isn't guaranteed to be claude)."""
+    pid = os.getppid()
+    for _ in range(10):
+        try:
+            out = subprocess.run(
+                ["ps", "-o", "ppid=,command=", "-p", str(pid)],
+                capture_output=True, text=True, timeout=5,
+            ).stdout.strip()
+            ppid_str, _, command = out.partition(" ")
+            ppid = int(ppid_str)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            break
+        exe = os.path.basename(command.split()[0]) if command.split() else ""
+        if "claude" in exe:
+            return pid
+        if ppid <= 1:
+            break
+        pid = ppid
+    return os.getppid()
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def pidfile_for_tty(tty):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    return os.path.join(CACHE_DIR, os.path.basename(tty) + ".pid")
+
+
+def kill_existing_watcher(tty):
+    pf = pidfile_for_tty(tty)
+    try:
+        with open(pf) as f:
+            old = int(f.read().strip())
+    except (OSError, ValueError):
+        return
+    if pid_alive(old):
+        # Only kill if it really is one of our watchers.
+        try:
+            cmd = subprocess.run(
+                ["ps", "-o", "command=", "-p", str(old)],
+                capture_output=True, text=True, timeout=5,
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            cmd = ""
+        if "iterm-claude-tab-color" in cmd:
+            try:
+                os.kill(old, signal.SIGTERM)
+            except OSError:
+                pass
+    try:
+        os.unlink(pf)
+    except OSError:
+        pass
+
+
+# --- subcommands ----------------------------------------------------------------
+
+def cmd_hook():
+    """SessionStart hook: spawn a detached watcher for this session's tty."""
+    if not is_iterm():
+        return 0
+    try:
+        payload = json.load(sys.stdin)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        payload = {}
+    transcript = payload.get("transcript_path")
+    if not transcript:
+        return 0
+    claude_pid = claude_ancestor()
+    tty = tty_of_pid(claude_pid)
+    if not tty:
+        return 0
+    kill_existing_watcher(tty)
+    proc = subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "watch",
+         "--transcript", transcript, "--tty", tty, "--pid", str(claude_pid)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    with open(pidfile_for_tty(tty), "w") as f:
+        f.write(str(proc.pid))
+    return 0
+
+
+def cmd_session_end():
+    """SessionEnd hook: stop the watcher and reset the tab color."""
+    if not is_iterm():
+        return 0
+    try:
+        json.load(sys.stdin)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        pass
+    tty = tty_of_pid(claude_ancestor())
+    if not tty:
+        return 0
+    kill_existing_watcher(tty)
+    write_to_tty(tty, tab_reset_sequence())
+    return 0
+
+
+def cmd_watch(transcript, tty, claude_pid):
+    """Poll the transcript; mirror /color entries onto the iTerm tab."""
+    offset = 0
+    current = None
+    while True:
+        if not pid_alive(claude_pid):
+            write_to_tty(tty, tab_reset_sequence())
+            try:
+                os.unlink(pidfile_for_tty(tty))
+            except OSError:
+                pass
+            return 0
+        try:
+            size = os.path.getsize(transcript)
+            if size < offset:  # truncated/rotated
+                offset = 0
+        except OSError:
+            size = 0  # transcript not written yet
+        if size > offset:
+            color, offset = last_color_in_file(transcript, offset)
+            if color and color != current:
+                if apply_color(tty, color):
+                    current = color
+        time.sleep(POLL_INTERVAL)
+
+
+def cmd_set(arg):
+    tty = find_tty()
+    if not tty:
+        print("error: no tty found", file=sys.stderr)
+        return 1
+    if arg in PALETTE:
+        rgb = PALETTE[arg]
+    elif re.fullmatch(r"#?[0-9a-fA-F]{6}", arg):
+        h = arg.lstrip("#")
+        rgb = tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+    else:
+        print(
+            "error: unknown color %r (use %s or #RRGGBB)"
+            % (arg, ", ".join(PALETTE)),
+            file=sys.stderr,
+        )
+        return 1
+    return 0 if write_to_tty(tty, tab_color_sequence(rgb)) else 1
+
+
+def cmd_reset():
+    tty = find_tty()
+    if not tty:
+        print("error: no tty found", file=sys.stderr)
+        return 1
+    return 0 if write_to_tty(tty, tab_reset_sequence()) else 1
+
+
+def main(argv):
+    if len(argv) < 2:
+        print(__doc__, file=sys.stderr)
+        return 2
+    cmd = argv[1]
+    if cmd == "hook":
+        return cmd_hook()
+    if cmd == "session-end":
+        return cmd_session_end()
+    if cmd == "watch":
+        args = dict(zip(argv[2::2], argv[3::2]))
+        return cmd_watch(args["--transcript"], args["--tty"], int(args["--pid"]))
+    if cmd == "set" and len(argv) == 3:
+        return cmd_set(argv[2])
+    if cmd == "reset":
+        return cmd_reset()
+    print(__doc__, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
