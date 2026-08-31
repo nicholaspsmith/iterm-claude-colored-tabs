@@ -15,7 +15,9 @@ hook input, not as an environment variable. Claude Code also never emits any
 terminal escape sequence for it.
 
 But every `/color <name>` you type **is** recorded in the session transcript
-(`~/.claude/projects/<project>/<session-id>.jsonl`) as a user entry:
+(`~/.claude/projects/<project>/<session-id>.jsonl`) as a
+`{"type": "system", "subtype": "local_command"}` entry (older versions used a
+user entry) whose content is:
 
 ```
 <command-name>/color</command-name>

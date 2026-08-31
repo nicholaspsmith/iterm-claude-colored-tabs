@@ -27,7 +27,23 @@ COLOR_CMD = (
 )
 
 
+def system_entry(content, subtype="local_command"):
+    return json.dumps({"type": "system", "subtype": subtype, "content": content})
+
+
 class TestParseLine(unittest.TestCase):
+    def test_system_local_command_entry(self):
+        # The shape Claude Code >= 2.1.x actually writes (verified live).
+        self.assertEqual(ictc.parse_line(system_entry(COLOR_CMD.format("blue"))), "blue")
+
+    def test_system_entry_wrong_subtype_ignored(self):
+        self.assertIsNone(
+            ictc.parse_line(system_entry(COLOR_CMD.format("blue"), subtype="info"))
+        )
+
+    def test_system_entry_no_content_ignored(self):
+        self.assertIsNone(ictc.parse_line(json.dumps({"type": "system", "subtype": "local_command"})))
+
     def test_genuine_color_command_string_content(self):
         self.assertEqual(ictc.parse_line(entry(COLOR_CMD.format("pink"))), "pink")
 

@@ -58,17 +58,24 @@ _CMD_RE = re.compile(
 def parse_line(line):
     """Return 'default', a palette color name, or None for a transcript line.
 
-    Only genuine user command entries match: type == "user" and the message
-    content itself (string, or a single text block) starts with the /color
-    command marker. Tool results that merely contain the marker text don't.
+    Only genuine command entries match. Current Claude Code (>= 2.1.x) logs
+    slash commands as {"type": "system", "subtype": "local_command"} with the
+    command text in top-level "content"; older transcripts used a user entry
+    whose message content (string, or a single text block) starts with the
+    marker. Tool results that merely contain the marker text don't match.
     """
     try:
         d = json.loads(line)
     except (json.JSONDecodeError, UnicodeDecodeError):
         return None
-    if d.get("type") != "user":
+    if d.get("type") == "system":
+        if d.get("subtype") != "local_command":
+            return None
+        content = d.get("content")
+    elif d.get("type") == "user":
+        content = d.get("message", {}).get("content")
+    else:
         return None
-    content = d.get("message", {}).get("content")
     if isinstance(content, list):
         if len(content) != 1 or not isinstance(content[0], dict):
             return None
