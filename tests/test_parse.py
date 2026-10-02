@@ -128,5 +128,41 @@ class TestLastColorInFile(unittest.TestCase):
             os.unlink(path)
 
 
+class TestSessionTitle(unittest.TestCase):
+    def test_rename_entry_gives_the_name(self):
+        line = json.dumps({"type": "custom-title", "customTitle": "  refactor auth ", "sessionId": "x"})
+        self.assertEqual(ictc.parse_title(line), "refactor auth")
+
+    def test_other_entries_and_empty_names_give_none(self):
+        self.assertIsNone(ictc.parse_title(entry("hello")))
+        self.assertIsNone(ictc.parse_title(json.dumps({"type": "custom-title", "customTitle": "  "})))
+        self.assertIsNone(ictc.parse_title("not json"))
+
+    def test_scan_file_returns_the_last_name(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f:
+            f.write(json.dumps({"type": "custom-title", "customTitle": "first"}) + "\n")
+            f.write(entry("hi") + "\n")
+            f.write(json.dumps({"type": "custom-title", "customTitle": "second"}) + "\n")
+        color, name, offset = ictc.scan_file(f.name)
+        os.unlink(f.name)
+        self.assertIsNone(color)
+        self.assertEqual(name, "second")
+        self.assertGreater(offset, 0)
+
+    def test_title_sequence_names_the_machine(self):
+        orig = ictc.socket.gethostname
+        try:
+            ictc.socket.gethostname = lambda: "MacBook-Pro-M5.local"
+            self.assertEqual(ictc.host_short(), "M5")
+            seq = ictc.title_sequence("Claude")
+            self.assertEqual(seq, b"\033]1;M5: Claude\a\033]2;M5: Claude\a")
+            ictc.socket.gethostname = lambda: "hpe-dinosaur"
+            self.assertEqual(ictc.host_short(), "hpe-dinosaur")
+            self.assertNotIn(b"\a\a", ictc.title_sequence("evil\aname"))
+        finally:
+            ictc.socket.gethostname = orig
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -24,6 +24,7 @@ Subcommands:
 
 import json
 import os
+import socket
 import re
 import signal
 import subprocess
@@ -93,19 +94,44 @@ def parse_line(line):
     return None  # empty (= random, unknowable) or unrecognized
 
 
-def last_color_in_file(path, offset=0):
-    """Scan transcript from offset; return (last color or None, new offset)."""
-    color = None
+def parse_title(line):
+    """The session name from a /rename entry ({"type": "custom-title"}), or None.
+    Auto-generated topic titles are not logged this way, so only a name the
+    user chose shows in the tab."""
+    try:
+        d = json.loads(line)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if d.get("type") != "custom-title":
+        return None
+    title = d.get("customTitle")
+    return title.strip() if isinstance(title, str) and title.strip() else None
+
+
+def scan_file(path, offset=0):
+    """Scan transcript from offset; return (last color, last session name,
+    new offset), the first two None when the scanned part has none."""
+    color = title = None
     try:
         with open(path, "rb") as f:
             f.seek(offset)
             for raw in f:
-                c = parse_line(raw.decode("utf-8", "replace"))
+                line = raw.decode("utf-8", "replace")
+                c = parse_line(line)
                 if c:
                     color = c
+                t = parse_title(line)
+                if t:
+                    title = t
             offset = f.tell()
     except OSError:
         pass
+    return color, title, offset
+
+
+def last_color_in_file(path, offset=0):
+    """Scan transcript from offset; return (last color or None, new offset)."""
+    color, _, offset = scan_file(path, offset)
     return color, offset
 
 
@@ -122,6 +148,20 @@ def tab_color_sequence(rgb):
 
 def tab_reset_sequence():
     return b"\033]6;1;bg;*;default\a"
+
+
+def host_short():
+    """The machine's short name, as the shell's tab title spells it:
+    "MacBook-Pro-M5.local" -> "M5"."""
+    host = socket.gethostname().split(".")[0]
+    return host[len("MacBook-Pro-"):] if host.startswith("MacBook-Pro-") else host
+
+
+def title_sequence(label):
+    """Tab (OSC 1) and window (OSC 2) title: "<machine>: <label>"."""
+    text = ("%s: %s" % (host_short(), label)).replace("\a", "").replace("\033", "")
+    data = text.encode("utf-8", "replace")
+    return b"\033]1;" + data + b"\a\033]2;" + data + b"\a"
 
 
 def wrap_tmux(seq):
@@ -299,17 +339,21 @@ def cmd_session_end():
     if not tty:
         return 0
     kill_existing_watcher(tty)
-    write_to_tty(tty, tab_reset_sequence())
+    write_to_tty(tty, tab_reset_sequence() + title_sequence("Shell"))
     return 0
 
 
 def cmd_watch(transcript, tty, claude_pid):
-    """Poll the transcript; mirror /color entries onto the iTerm tab."""
+    """Poll the transcript; mirror /color entries onto the iTerm tab, and
+    title the tab "<machine>: Claude", or "<machine>: <name>" once the
+    session has one (/rename)."""
     offset = 0
     current = None
+    title = None
+    write_to_tty(tty, title_sequence("Claude"))
     while True:
         if not pid_alive(claude_pid):
-            write_to_tty(tty, tab_reset_sequence())
+            write_to_tty(tty, tab_reset_sequence() + title_sequence("Shell"))
             try:
                 os.unlink(pidfile_for_tty(tty))
             except OSError:
@@ -322,10 +366,13 @@ def cmd_watch(transcript, tty, claude_pid):
         except OSError:
             size = 0  # transcript not written yet
         if size > offset:
-            color, offset = last_color_in_file(transcript, offset)
+            color, name, offset = scan_file(transcript, offset)
             if color and color != current:
                 if apply_color(tty, color):
                     current = color
+            if name and name != title:
+                if write_to_tty(tty, title_sequence(name)):
+                    title = name
         time.sleep(POLL_INTERVAL)
 
 
